@@ -3,31 +3,23 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(__x86_64__) || defined(_M_X64)
-    #define ARCH "x86_64"
-#elif defined(__i386__) || defined(_M_IX86)
-    #define ARCH "x86 (32-bit)"
-#elif defined(__aarch64__)
-    #define ARCH "ARM64"
-#elif defined(__arm__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #define ARCH "x86/x64"
+    #include <immintrin.h>
+    #include <cpuid.h>
+#elif defined(__aarch64__) || defined(__arm__)
     #define ARCH "ARM"
+    #include <arm_neon.h>
 #else
     #define ARCH "Unknown"
 #endif
 
-// Print the architecture.
 void print_architecture() {
     printf("Architecture: %s\n", ARCH);
 }
 
-//
-// Function pointer type for search routines.
-//
 typedef int (*search_func_t)(const char *text, int n, const char *pattern, int m);
 
-//
-// Naive search implementation (fallback).
-//
 int naive_search(const char *text, int n, const char *pattern, int m) {
     for (int i = 0; i <= n - m; i++) {
         if (memcmp(text + i, pattern, m) == 0)
@@ -37,52 +29,105 @@ int naive_search(const char *text, int n, const char *pattern, int m) {
 }
 
 //
-// ----- x86 SSE4.2 implementations -----
-// We assume α = 16 (i.e., 16 characters per SIMD register).
+// ----- x86 SSE4.2 Implementations -----
+// These functions are compiled only on x86/x64.
 //
-#if defined(__x86_64__) || defined(_M_X86) || defined(__i386__) || defined(_M_IX86)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
-#include <immintrin.h>
-#include <cpuid.h>
-
-// A simple EPSMa-like variant.
-// It uses the first m0 = min(m, 8) characters to filter candidate positions.
-int epsm_a(const char *text, int n, const char *pattern, int m) {
+//
+// EPSMa-like variant (epsm_a_opt):
+// Uses the first m0 = min(m,8) pattern characters (broadcast into registers)
+// and unrolls the inner loop via a switch-case to avoid loop overhead.
+//
+static inline int epsm_a_opt(const char *text, int n, const char *pattern, int m) {
     int m0 = (m < 8 ? m : 8);
-    // Precompute broadcast vectors for the first m0 characters.
     __m128i B[8];
     for (int i = 0; i < m0; i++) {
         B[i] = _mm_set1_epi8(pattern[i]);
     }
-    // Slide over the text.
     for (int i = 0; i <= n - m; i++) {
-        int candidate = 1;
         __m128i block = _mm_loadu_si128((const __m128i*)(text + i));
-        for (int j = 0; j < m0; j++) {
-            __m128i cmp = _mm_cmpeq_epi8(block, B[j]);
-            int mask = _mm_movemask_epi8(cmp);
-            // Check if the j-th bit in the mask is set.
-            if (!(mask & (1 << j))) {
-                candidate = 0;
+        switch(m0) {
+            case 1:
+                if (_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
                 break;
-            }
-        }
-        if (candidate) {
-            // Verify full pattern if necessary.
-            if (m == m0 || memcmp(text + i, pattern, m) == 0)
-                return i;
+            case 2:
+                if (((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[1])) & 2) != 0)) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
+                break;
+            case 3:
+                if (((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[1])) & 2) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[2])) & 4) != 0)) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
+                break;
+            case 4:
+                if (((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[1])) & 2) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[2])) & 4) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[3])) & 8) != 0)) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
+                break;
+            case 5:
+                if (((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[1])) & 2) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[2])) & 4) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[3])) & 8) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[4])) & 16) != 0)) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
+                break;
+            case 6:
+                if (((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[1])) & 2) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[2])) & 4) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[3])) & 8) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[4])) & 16) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[5])) & 32) != 0)) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
+                break;
+            case 7:
+                if (((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[1])) & 2) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[2])) & 4) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[3])) & 8) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[4])) & 16) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[5])) & 32) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[6])) & 64) != 0)) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
+                break;
+            case 8:
+                if (((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[0])) & 1) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[1])) & 2) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[2])) & 4) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[3])) & 8) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[4])) & 16) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[5])) & 32) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[6])) & 64) != 0) &&
+                    ((_mm_movemask_epi8(_mm_cmpeq_epi8(block, B[7])) & 128) != 0)) {
+                    if (memcmp(text + i, pattern, m) == 0) return i;
+                }
+                break;
+            default:
+                break;
         }
     }
     return -1;
 }
 
-// A short-pattern variant (EPSMb-like) that processes blocks of 16 bytes and blends adjacent blocks.
-int epsm_b(const char *text, int n, const char *pattern, int m) {
+// EPSMb-like variant (epsm_b_opt): processes text in 16-byte blocks and blends adjacent blocks.
+static inline int epsm_b_opt(const char *text, int n, const char *pattern, int m) {
     int m0 = (m < 8 ? m : 8);
-    // Process text in chunks of 16.
     for (int i = 0; i <= n - m; i += 16) {
         __m128i block = _mm_loadu_si128((const __m128i*)(text + i));
-        // Check positions within this block.
         for (int j = 0; j <= 16 - m0; j++) {
             if (i + j > n - m)
                 break;
@@ -91,7 +136,6 @@ int epsm_b(const char *text, int n, const char *pattern, int m) {
                     return i + j;
             }
         }
-        // Blend with the next block to catch occurrences crossing the boundary.
         if (i + 16 < n) {
             __m128i block_next = _mm_loadu_si128((const __m128i*)(text + i + 16));
             __m128i blend = _mm_or_si128(_mm_srli_si128(block, 8), _mm_slli_si128(block_next, 8));
@@ -110,35 +154,78 @@ int epsm_b(const char *text, int n, const char *pattern, int m) {
     return -1;
 }
 
-// Unified epsm_search for x86 chooses between epsm_b and epsm_a based on pattern length.
-int epsm_search_x86(const char *text, int n, const char *pattern, int m) {
-    static search_func_t search_func = NULL;
-    static int last_m = 0;
-    if (search_func == NULL || last_m != m) {
-        if (m <= 8)
-            search_func = epsm_b;  // For very short patterns, use EPSMb-like.
-        else if (m <= 32)
-            search_func = epsm_a;  // For medium-length patterns, use EPSMa-like.
-        else
-            search_func = naive_search; // For long patterns, fallback.
-        last_m = m;
+// EPSMc-like variant remains as before.
+static inline int epsm_c(const char *text, int n, const char *pattern, int m) {
+    if (m < 16)
+        return naive_search(text, n, pattern, m);
+    
+    const int alpha = 16;
+    const int k = 11;
+    int mask = (1 << k) - 1;
+    int num_candidates = m - alpha + 1;
+    int *candidates = malloc(num_candidates * sizeof(int));
+    int *hashes = malloc(num_candidates * sizeof(int));
+    if (!candidates || !hashes) {
+        free(candidates);
+        free(hashes);
+        return naive_search(text, n, pattern, m);
     }
-    return search_func(text, n, pattern, m);
+    for (int i = 0; i < num_candidates; i++) {
+        int h = 0;
+        for (int j = 0; j < alpha; j++) {
+            h += (unsigned char)pattern[i+j];
+        }
+        h = h & mask;
+        candidates[i] = i;
+        hashes[i] = h;
+    }
+    
+    int pos_found = -1;
+    for (int i = 0; i <= n - alpha; i += alpha) {
+        int h = 0;
+        for (int j = 0; j < alpha; j++) {
+            h += (unsigned char)text[i+j];
+        }
+        h = h & mask;
+        for (int k_i = 0; k_i < num_candidates; k_i++) {
+            if (hashes[k_i] == h) {
+                int pos = i - candidates[k_i];
+                if (pos >= 0 && pos <= n - m) {
+                    if (memcmp(text + pos, pattern, m) == 0) {
+                        pos_found = pos;
+                        goto cleanup;
+                    }
+                }
+            }
+        }
+    }
+cleanup:
+    free(candidates);
+    free(hashes);
+    return pos_found;
 }
 
+// Unified EPSM search for x86: choose variant based on pattern length.
+static inline int epsm_search_x86(const char *text, int n, const char *pattern, int m) {
+    if (m <= 8)
+        return epsm_b_opt(text, n, pattern, m);
+    else if (m <= 32)
+        return epsm_a_opt(text, n, pattern, m);
+    else if (m <= 128)
+        return epsm_c(text, n, pattern, m);
+    else
+        return naive_search(text, n, pattern, m);
+}
 #define epsm_search epsm_search_x86
 
 //
-// ----- ARM NEON implementation -----
+// ----- End x86 Implementations -----
 //
 #elif defined(__aarch64__) || defined(__arm__)
-
-#include <arm_neon.h>
-#include <stdint.h>
-
-// A simple NEON-based implementation for short patterns (up to 16 bytes).
-int epsm_neon(const char *text, int n, const char *pattern, int m) {
-    if (m > 16) return -1;  // Out-of-scope.
+// ARM NEON implementation.
+static inline int epsm_neon(const char *text, int n, const char *pattern, int m) {
+    if (m > 16)
+        return naive_search(text, n, pattern, m);
     uint8_t patbuf[16] = {0};
     memcpy(patbuf, pattern, m);
     uint8x16_t pat = vld1q_u8(patbuf);
@@ -159,19 +246,15 @@ int epsm_neon(const char *text, int n, const char *pattern, int m) {
     }
     return -1;
 }
-int epsm_search(const char *text, int n, const char *pattern, int m) {
+static inline int epsm_search(const char *text, int n, const char *pattern, int m) {
     return epsm_neon(text, n, pattern, m);
 }
 #else
-// Fallback for other architectures.
-int epsm_search(const char *text, int n, const char *pattern, int m) {
+static inline int epsm_search(const char *text, int n, const char *pattern, int m) {
     return naive_search(text, n, pattern, m);
 }
 #endif
 
-//
-// Helper: Generate a text buffer by repeating a sample string until size is reached.
-//
 void generate_text(char *buffer, int size, const char *sample) {
     int sample_len = (int)strlen(sample);
     int pos = 0;
@@ -186,64 +269,51 @@ void generate_text(char *buffer, int size, const char *sample) {
 }
 
 //
-// Main function: Benchmark different pattern sizes on a fixed large text.
+// Main: Benchmark across various pattern lengths on a large text.
 //
 int main() {
     print_architecture();
 
-    // Use a large text (e.g., 1,000,000 characters).
     int textSize = 1000000;
-    char *text = (char *)malloc(textSize + 1);
+    char *text = malloc(textSize + 1);
     if (!text) {
-        fprintf(stderr, "Failed to allocate memory for the text.\n");
+        fprintf(stderr, "Failed to allocate text buffer.\n");
         return 1;
     }
     const char *sampleText = "This is a sample text for testing the EPSM algorithm. "
                              "We want to see if the pattern is found using SIMD! ";
     generate_text(text, textSize, sampleText);
-    
-    // Define an array of pattern lengths to test.
-    int patLens[] = {4, 8, 16, 32, 64};
-    int numPatLens = sizeof(patLens) / sizeof(patLens[0]);
-    
     printf("Text size: %d characters\n", textSize);
     printf("-------------------------------------------------\n");
-    
-    // For each pattern length, extract a pattern from a fixed offset so a match is known.
+
+    int patLens[] = {4, 8, 16, 32, 64};
+    int numPatLens = sizeof(patLens) / sizeof(patLens[0]);
     for (int p = 0; p < numPatLens; p++) {
         int m = patLens[p];
-        // Ensure we have enough text.
         if (m > textSize) break;
-        // For this POC, take a pattern starting at offset 50.
-        const char *pattern = text + 50;
-        // Ensure we compare exactly m characters.
-        char *patternBuf = (char *)malloc(m + 1);
+        const char *pattern = text + 50;  // Choose a pattern from a known offset.
+        char *patternBuf = malloc(m + 1);
         if (!patternBuf) continue;
         memcpy(patternBuf, pattern, m);
         patternBuf[m] = '\0';
-        
-        // Display the pattern.
+
         printf("Pattern (length %d): \"%s\"\n", m, patternBuf);
-        
-        // Verify that both methods find a match.
-        int pos1 = epsm_search(text, textSize, patternBuf, m);
-        int pos2 = naive_search(text, textSize, patternBuf, m);
-        if (pos1 >= 0)
-            printf("EPSM: Pattern found at position %d\n", pos1);
+
+        int pos_epsm = epsm_search(text, textSize, patternBuf, m);
+        int pos_naive = naive_search(text, textSize, patternBuf, m);
+        if (pos_epsm >= 0)
+            printf("EPSM: Pattern found at position %d\n", pos_epsm);
         else
             printf("EPSM: Pattern not found.\n");
-        if (pos2 >= 0)
-            printf("Naive: Pattern found at position %d\n", pos2);
+        if (pos_naive >= 0)
+            printf("Naive: Pattern found at position %d\n", pos_naive);
         else
             printf("Naive: Pattern not found.\n");
-        
-        // Choose a suitable iteration count (fewer iterations for longer patterns).
+
         int iterations = (m <= 8 ? 100000 : (m <= 32 ? 10000 : 1000));
-        
         clock_t start, end;
         double epsm_time, naive_time;
-        
-        // Benchmark EPSM search.
+
         start = clock();
         for (int i = 0; i < iterations; i++) {
             volatile int dummy = epsm_search(text, textSize, patternBuf, m);
@@ -251,8 +321,7 @@ int main() {
         }
         end = clock();
         epsm_time = (double)(end - start) / CLOCKS_PER_SEC;
-        
-        // Benchmark naive search.
+
         start = clock();
         for (int i = 0; i < iterations; i++) {
             volatile int dummy = naive_search(text, textSize, patternBuf, m);
@@ -260,16 +329,16 @@ int main() {
         }
         end = clock();
         naive_time = (double)(end - start) / CLOCKS_PER_SEC;
-        
+
         printf("EPSM search: %f seconds for %d iterations\n", epsm_time, iterations);
         printf("Naive search: %f seconds for %d iterations\n", naive_time, iterations);
         double improvement = (naive_time - epsm_time) / naive_time * 100;
         printf("Performance Improvement: %.2f%%\n", improvement);
         printf("-------------------------------------------------\n");
-        
+
         free(patternBuf);
     }
-    
+
     free(text);
     return 0;
 }
